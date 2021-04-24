@@ -2,7 +2,6 @@ import os
 import sys
 import platform
 import re
-import tarfile
 import requests
 
 from metaflow.decorators import StepDecorator
@@ -12,7 +11,6 @@ from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
 from metaflow.metadata import MetaDatum
 from metaflow.metadata.util import sync_local_metadata_to_datastore
 
-from metaflow import util
 from metaflow import R
 
 from .batch import BatchException
@@ -220,8 +218,7 @@ class BatchDecorator(StepDecorator):
 
     def task_finished(self, step_name, flow, graph, is_task_ok, retry_count, max_retries):
         if self.task_datastore:
-            sync_local_metadata_to_datastore(DATASTORE_LOCAL_DIR, 
-                self.task_datastore)
+            sync_local_metadata_to_datastore(self.task_datastore)
         try:
             self._save_logs_sidecar.kill()
         except:

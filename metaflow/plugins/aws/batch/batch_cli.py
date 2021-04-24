@@ -4,16 +4,17 @@ import sys
 import time
 import traceback
 
-from distutils.dir_util import copy_tree
+from .batch import Batch, BatchKilledException
 
 from metaflow import util
+from metaflow.metadata.util import sync_local_metadata_from_datastore
+from metaflow.plugins.aws.utils import CommonTaskAttrs
+
 from metaflow import R
 from metaflow.exception import CommandException, METAFLOW_EXIT_DISALLOW_RETRY
-from metaflow.metadata.util import sync_local_metadata_from_datastore
 from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
 from metaflow.mflog import TASK_LOG_SOURCE
 
-from .batch import Batch, BatchKilledException
 
 @click.group()
 def cli():
@@ -189,19 +190,20 @@ def step(
             retry_deco[0].attributes.get("minutes_between_retries", 1)
         )
 
-    # Set batch attributes
-    task_spec = {
-        'flow_name': ctx.obj.flow.name,
-        'step_name': step_name,
-        'run_id': kwargs['run_id'],
-        'task_id': kwargs['task_id'],
-        'retry_count': str(retry_count)
-    }
-    attrs = {'metaflow.%s' % k: v for k, v in task_spec.items()}
-    attrs['metaflow.user'] = util.get_username()
-    attrs['metaflow.version'] = ctx.obj.environment.get_environment_info()[
+    common_attrs = CommonTaskAttrs(
+        flow_name=ctx.obj.flow.name,
+        run_id=kwargs['run_id'],
+        step_name=step_name,
+        task_id=kwargs['task_id'],
+        attempt=retry_count,
+        user=util.get_username(),
+        version=ctx.obj.environment.get_environment_info()[
             "metaflow_version"
         ]
+    )
+
+    # Set batch attributes
+    attrs = common_attrs.to_dict(key_prefix='metaflow.')
 
     env_deco = [deco for deco in node.decorators if deco.name == "environment"]
     if env_deco:
@@ -230,20 +232,19 @@ def step(
     stdout_location = ds.get_log_location(TASK_LOG_SOURCE, 'stdout')
     stderr_location = ds.get_log_location(TASK_LOG_SOURCE, 'stderr')
 
-    def _sync_metadata():
-        if ctx.obj.metadata.TYPE == 'local':
-            sync_local_metadata_from_datastore(DATASTORE_LOCAL_DIR, ds)
-
     batch = Batch(ctx.obj.metadata, ctx.obj.environment)
     try:
         with ctx.obj.monitor.measure("metaflow.batch.launch"):
             batch.launch_job(
-                step_name,
-                step_cli,
-                task_spec,
-                code_package_sha,
-                code_package_url,
-                ctx.obj.flow_datastore.TYPE,
+                flow_name=ctx.obj.flow.name,
+                run_id=kwargs['run_id'],
+                step_name=step_name,
+                task_id=kwargs['task_id'],
+                step_cli=step_cli,
+                attempt=str(retry_count),
+                code_package_sha=code_package_sha,
+                code_package_url=code_package_url,
+                code_package_ds=ctx.obj.flow_datastore.TYPE,
                 image=image,
                 queue=queue,
                 iam_role=iam_role,
@@ -261,13 +262,14 @@ def step(
             )
     except Exception as e:
         print(e)
-        _sync_metadata()
+        sync_local_metadata_from_datastore(ctx.obj.metadata, ds)
         sys.exit(METAFLOW_EXIT_DISALLOW_RETRY)
     try:
         batch.wait(stdout_location, stderr_location, echo=echo)
     except BatchKilledException:
         # don't retry killed tasks
         traceback.print_exc()
-        _sync_metadata()
+        sync_local_metadata_from_datastore(ctx.obj.metadata, ds)
         sys.exit(METAFLOW_EXIT_DISALLOW_RETRY)
-    _sync_metadata()
+
+    sync_local_metadata_from_datastore(ctx.obj.metadata, ds)
