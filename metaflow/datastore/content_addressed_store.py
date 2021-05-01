@@ -144,6 +144,9 @@ class ContentAddressedStore(object):
             # At this point, we either return the object as is (if raw) or
             # decode it according to the encoding version
             result, meta = load_results[path]
+            if result is None:
+                results[k] = None
+                continue
             if force_raw or (meta and meta.get('cas_raw', False)):
                 with result as r:
                     results[k] = r.read()
