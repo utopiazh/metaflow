@@ -270,7 +270,7 @@ class CondaStepDecorator(StepDecorator):
 
     def task_pre_step(
             self, step_name, task_datastore, meta, run_id, task_id, flow, graph, retry_count,
-            max_retries, ubf_context):
+            max_retries, ubf_context, input_obj):
         if self.is_enabled(ubf_context):
             meta.register_metadata(run_id, step_name, task_id,
                                        [MetaDatum(field='conda_env_id',

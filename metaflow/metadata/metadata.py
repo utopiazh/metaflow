@@ -430,7 +430,7 @@ class MetadataProvider(object):
             'field_name': datum.field,
             'type': datum.type,
             'value': datum.value,
-            'tags': datum.tags,
+            'tags': datum.tags if datum.tags else [],
             'user_name': user,
             'ts_epoch': int(round(time.time() * 1000))} for datum in metadata]
 

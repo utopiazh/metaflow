@@ -21,7 +21,8 @@ class StepFunctionsInternalDecorator(StepDecorator):
                       graph,
                       retry_count,
                       max_user_code_retries,
-                      ubf_context):
+                      ubf_context,
+                      input_obj):
         if ubf_context == UBF_TASK:
             # Don't register any metadata for tasks that don't run within SFN.
             return
