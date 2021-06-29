@@ -29,20 +29,24 @@ STDERR_FILE = 'mflog_stderr'
 STDOUT_PATH = os.path.join(LOGS_DIR, STDOUT_FILE)
 STDERR_PATH = os.path.join(LOGS_DIR, STDERR_FILE)
 
-class BatchException(MetaflowException):
-    headline = 'AWS Batch error'
+class KuberneterException(MetaflowException):
+    headline = 'Kubernetes error'
 
 
-class BatchKilledException(MetaflowException):
-    headline = 'AWS Batch task killed'
+class KubernetesBatchJobKilledException(MetaflowException):
+    headline = 'Kubernetes Batch job killed'
 
 
-class Batch(object):
-    def __init__(self, metadata, environment):
-        self.metadata = metadata
+class Kubernetes(object):
+
+    def __init__(self,
+                 environment):
         self.environment = environment
-        self._client = BatchClient()
-        atexit.register(lambda: self.job.kill() if hasattr(self, 'job') else None)
+        self.k8s_client = KubernetesClient()
+
+        # Issue a kill request for all pending Batch jobs at exit.
+        atexit.register(
+            lambda: self.job.kill() if hasattr(self, 'job') else None)
 
     def _command(self,
                  environment,
@@ -79,92 +83,38 @@ class Batch(object):
         cmd_str += 'c=$?; %s; exit $c' % BASH_SAVE_LOGS
         return shlex.split('bash -c \"%s\"' % cmd_str)
 
-    def _search_jobs(self, flow_name, run_id, user):
-        if user is None:
-            regex = '-{flow_name}-'.format(flow_name=flow_name)
-        else:
-            regex = '{user}-{flow_name}-'.format(
-                user=user, flow_name=flow_name
-            )
-        jobs = []
-        for job in self._client.unfinished_jobs():
-            if regex in job['jobName']:
-                jobs.append(job['jobId'])
-        if run_id is not None:
-            run_id = run_id[run_id.startswith('sfn-') and len('sfn-'):]
-        for job in self._client.describe_jobs(jobs):
-            parameters = job['parameters']
-            match = (user is None or parameters['metaflow.user'] == user) and \
-                    (parameters['metaflow.flow_name'] == flow_name) and \
-                    (run_id is None or parameters['metaflow.run_id'] == run_id)
-            if match:
-                yield job
+    def job_name(self,
+                 user,
+                 flow_name,
+                 run_id,
+                 step_name,
+                 task_id,
+                 retry_count):
+        return '{user}-{flow_name}-{run_id}-{step_name}-{task_id}'
+                    '-{retry_count}'.format(
+                        user=user,
+                        flow_name=flow_name,
+                        run_id=str(run_id) if run_id is not None else '',
+                        step_name=step_name,
+                        task_id=str(task_id) if task_id is not None else '',
+                        retry_count=str(retry_count) \
+                                        if retry_count is not None else '')
 
-    def _job_name(self, user, flow_name, run_id, step_name, task_id, retry_count):
-        return '{user}-{flow_name}-{run_id}-{step_name}-{task_id}-{retry_count}'.format(
-            user=user,
-            flow_name=flow_name,
-            run_id=str(run_id) if run_id is not None else '',
-            step_name=step_name,
-            task_id=str(task_id) if task_id is not None else '',
-            retry_count=str(retry_count) if retry_count is not None else ''
-        )
-
-    def list_jobs(self, flow_name, run_id, user, echo):
-        jobs = self._search_jobs(flow_name, run_id, user)
-        found = False
-        for job in jobs:
-            found = True
-            echo(
-                '{name} [{id}] ({status})'.format(
-                    name=job['jobName'], id=job['jobId'], status=job['status']
-                )
-            )
-        if not found:
-            echo('No running AWS Batch jobs found.')
-
-    def kill_jobs(self, flow_name, run_id, user, echo):
-        jobs = self._search_jobs(flow_name, run_id, user)
-        found = False
-        for job in jobs:
-            found = True
-            try:
-                self._client.attach_job(job['jobId']).kill()
-                echo(
-                    'Killing AWS Batch job: {name} [{id}] ({status})'.format(
-                        name=job['jobName'], id=job['jobId'], status=job['status']
-                    )
-                )
-            except Exception as e:
-                echo(
-                    'Failed to terminate AWS Batch job %s [%s]'
-                    % (job['jobId'], repr(e))
-                )
-        if not found:
-            echo('No running AWS Batch jobs found.')
-
-    def create_job(
-        self,
-        step_name,
-        step_cli,
-        task_spec,
-        code_package_sha,
-        code_package_url,
-        code_package_ds,
-        image,
-        queue,
-        iam_role=None,
-        execution_role=None,
-        cpu=None,
-        gpu=None,
-        memory=None,
-        run_time_limit=None,
-        shared_memory=None,
-        max_swap=None,
-        swappiness=None,
-        env={},
-        attrs={}
-    ):
+    def create_job(self,
+                   step_name,
+                   step_cli,
+                   task_spec,
+                   code_package_sha,
+                   code_package_url,
+                   code_package_ds,
+                   image,
+                   iam_role=None,
+                   cpu=None,
+                   gpu=None,
+                   memory=None,
+                   run_time_limit=None,
+                   env={},
+                   attrs={}):
         job_name = self._job_name(
             attrs.get('metaflow.user'),
             attrs.get('metaflow.flow_name'),
@@ -173,99 +123,74 @@ class Batch(object):
             attrs.get('metaflow.task_id'),
             attrs.get('metaflow.retry_count')
         )
-        job = self._client.job()
+        job = self.k8s_client.job()
         job \
             .job_name(job_name) \
-            .job_queue(queue) \
             .command(
                 self._command(self.environment, code_package_url,
                               step_name, [step_cli], task_spec)) \
             .image(image) \
             .iam_role(iam_role) \
-            .execution_role(execution_role) \
-            .job_def(image, iam_role,
-                queue, execution_role, shared_memory,
-                max_swap, swappiness) \
             .cpu(cpu) \
             .gpu(gpu) \
             .memory(memory) \
-            .shared_memory(shared_memory) \
-            .max_swap(max_swap) \
-            .swappiness(swappiness) \
             .timeout_in_secs(run_time_limit) \
-            .environment_variable('AWS_DEFAULT_REGION', self._client.region()) \
+            .environment_variable('AWS_DEFAULT_REGION', 'us-west-2') \
             .environment_variable('METAFLOW_CODE_SHA', code_package_sha) \
             .environment_variable('METAFLOW_CODE_URL', code_package_url) \
             .environment_variable('METAFLOW_CODE_DS', code_package_ds) \
             .environment_variable('METAFLOW_USER', attrs['metaflow.user']) \
-            .environment_variable('METAFLOW_SERVICE_URL', BATCH_METADATA_SERVICE_URL) \
-            .environment_variable('METAFLOW_SERVICE_HEADERS', json.dumps(BATCH_METADATA_SERVICE_HEADERS)) \
-            .environment_variable('METAFLOW_DATASTORE_SYSROOT_S3', DATASTORE_SYSROOT_S3) \
-            .environment_variable('METAFLOW_DATATOOLS_S3ROOT', DATATOOLS_S3ROOT) \
+            .environment_variable('METAFLOW_SERVICE_URL', 
+                                        BATCH_METADATA_SERVICE_URL) \
+            .environment_variable('METAFLOW_SERVICE_HEADERS', 
+                                        json.dumps(
+                                            BATCH_METADATA_SERVICE_HEADERS)) \
+            .environment_variable('METAFLOW_DATASTORE_SYSROOT_S3',
+                                        DATASTORE_SYSROOT_S3) \
+            .environment_variable('METAFLOW_DATATOOLS_S3ROOT', 
+                                        DATATOOLS_S3ROOT) \
             .environment_variable('METAFLOW_DEFAULT_DATASTORE', 's3') \
             .environment_variable('METAFLOW_DEFAULT_METADATA', DEFAULT_METADATA)
-            # Skip setting METAFLOW_DATASTORE_SYSROOT_LOCAL because metadata sync between the local user 
-            # instance and the remote AWS Batch instance assumes metadata is stored in DATASTORE_LOCAL_DIR 
-            # on the remote AWS Batch instance; this happens when METAFLOW_DATASTORE_SYSROOT_LOCAL 
-            # is NOT set (see get_datastore_root_from_config in datastore/local.py).
+            # Skip setting METAFLOW_DATASTORE_SYSROOT_LOCAL because metadata 
+            # sync between the local user instance and the remote Kubernetes 
+            # instance assumes metadata is stored in DATASTORE_LOCAL_DIR 
+            # on the remote Kubernetes instance; this happens when 
+            # METAFLOW_DATASTORE_SYSROOT_LOCAL is NOT set (see 
+            # get_datastore_root_from_config in datastore/local.py).
         for name, value in env.items():
             job.environment_variable(name, value)
-        if attrs:
-            for key, value in attrs.items():
-                job.parameter(key, value)
         return job
 
-    def launch_job(
-        self,
-        step_name,
-        step_cli,
-        task_spec,
-        code_package_sha,
-        code_package_url,
-        code_package_ds,
-        image,
-        queue,
-        iam_role=None,
-        execution_role=None, # for FARGATE compatibility
-        cpu=None,
-        gpu=None,
-        memory=None,
-        run_time_limit=None,
-        shared_memory=None,
-        max_swap=None,
-        swappiness=None,
-        env={},
-        attrs={},
-        ):
-        if queue is None:
-            queue = next(self._client.active_job_queues(), None)
-            if queue is None:
-                raise BatchException(
-                    'Unable to launch AWS Batch job. No job queue '
-                    ' specified and no valid & enabled queue found.'
-                )
-        job = self.create_job(
-                        step_name,
-                        step_cli,
-                        task_spec,
-                        code_package_sha,
-                        code_package_url,
-                        code_package_ds,
-                        image,
-                        queue,
-                        iam_role,
-                        execution_role,
-                        cpu,
-                        gpu,
-                        memory,
-                        run_time_limit,
-                        shared_memory,
-                        max_swap,
-                        swappiness,
-                        env,
-                        attrs
-        )
-        self.job = job.execute()
+    def launch_job(self,
+                   step_name,
+                   step_cli,
+                   task_spec,
+                   code_package_sha,
+                   code_package_url,
+                   code_package_ds,
+                   image
+                   iam_role=None,
+                   cpu=None,
+                   gpu=None,
+                   memory=None,
+                   run_time_limit=None,
+                   env={},
+                   attrs={}):
+
+        self.job = self.create_job(step_name,
+                                   step_cli,
+                                   task_spec,
+                                   code_package_sha,
+                                   code_package_url,
+                                   code_package_ds,
+                                   image,
+                                   iam_role,
+                                   cpu,
+                                   gpu,
+                                   memory,
+                                   run_time_limit,
+                                   env,
+                                   attrs).execute()
 
     def wait(self, stdout_location, stderr_location, echo=None):
         

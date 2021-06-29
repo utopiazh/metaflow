@@ -6,10 +6,10 @@ from metaflow.decorators import StepDecorator
 
 class EnvironmentDecorator(StepDecorator):
     """
-    Step decorator to add or update environment variables prior to the execution of your step.
+    Step decorator to assign environment variables to the user code in a step.
 
-    The environment variables set with this decorator will be present during the execution of the
-    step.
+    The environment variables set with this decorator will be present during
+    the execution of the step.
 
     To use, annotate your step as follows:
     ```
@@ -22,7 +22,7 @@ class EnvironmentDecorator(StepDecorator):
     Parameters
     ----------
     vars : Dict
-        Dictionary of environment variables to add/update prior to executing your step.
+        Dictionary of environment variables to assign to your step.
     """
     name = 'environment'
     defaults = {'vars': {}}

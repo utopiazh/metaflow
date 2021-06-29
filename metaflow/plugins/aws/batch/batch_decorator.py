@@ -1,7 +1,6 @@
 import os
 import sys
 import platform
-import re
 import tarfile
 import requests
 
@@ -17,11 +16,13 @@ from metaflow.metadata import MetaDatum
 from metaflow import util
 from metaflow import R
 
-from .batch import Batch, BatchException
 from metaflow.metaflow_config import ECS_S3_ACCESS_IAM_ROLE, BATCH_JOB_QUEUE, \
                     BATCH_CONTAINER_IMAGE, BATCH_CONTAINER_REGISTRY, \
                     ECS_FARGATE_EXECUTION_ROLE
 from metaflow.sidecar import SidecarSubProcess
+
+from .batch import Batch, BatchException
+from ..aws_utils import get_docker_registry
 
 try:
     # python2
@@ -110,7 +111,7 @@ class BatchDecorator(StepDecorator):
                 else:
                     self.attributes['image'] = 'python:%s.%s' % (platform.python_version_tuple()[0],
                         platform.python_version_tuple()[1])
-        if not BatchDecorator._get_registry(self.attributes['image']):
+        if not get_docker_registry(self.attributes['image']):
             if BATCH_CONTAINER_REGISTRY:
                 self.attributes['image'] = '%s/%s' % (BATCH_CONTAINER_REGISTRY.rstrip('/'),
                     self.attributes['image'])
@@ -239,57 +240,3 @@ class BatchDecorator(StepDecorator):
         if cls.package_url is None:
             cls.package_url = datastore.save_data(package.sha, TransformableObject(package.blob))
             cls.package_sha = package.sha
-
-    @classmethod
-    def _get_registry(cls, image):
-        """
-        Explanation:
-
-            (.+?(?:[:.].+?)\/)? - [GROUP 0] REGISTRY
-                .+?                 - A registry must start with at least one character
-                (?:[:.].+?)\/       - A registry must have ":" or "." and end with "/"
-                ?                   - Make a registry optional
-            (.*?)               - [GROUP 1] REPOSITORY
-                .*?                 - Get repository name until separator
-            (?:[@:])?           - SEPARATOR
-                ?:                  - Don't capture separator
-                [@:]                - The separator must be either "@" or ":"
-                ?                   - The separator is optional
-            ((?<=[@:]).*)?      - [GROUP 2] TAG / DIGEST
-                (?<=[@:])           - A tag / digest must be preceeded by "@" or ":"
-                .*                  - Capture rest of tag / digest
-                ?                   - A tag / digest is optional
-
-        Examples:
-
-            image
-                - None
-                - image
-                - None
-            example/image
-                - None
-                - example/image
-                - None
-            example/image:tag
-                - None
-                - example/image
-                - tag
-            example.domain.com/example/image:tag
-                - example.domain.com/
-                - example/image
-                - tag
-            123.123.123.123:123/example/image:tag
-                - 123.123.123.123:123/
-                - example/image
-                - tag
-            example.domain.com/example/image@sha256:45b23dee0
-                - example.domain.com/
-                - example/image
-                - sha256:45b23dee0
-        """
-
-        pattern = re.compile(r"^(.+?(?:[:.].+?)\/)?(.*?)(?:[@:])?((?<=[@:]).*)?$")
-        registry, repository, tag = pattern.match(image).groups()
-        if registry is not None:
-            registry = registry.rstrip("/")
-        return registry
