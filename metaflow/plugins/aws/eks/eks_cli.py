@@ -1,38 +1,25 @@
+import click
 import os
 import sys
-import tarfile
 import time
 import traceback
 
-import click
-
-from distutils.dir_util import copy_tree
-
-from .batch import Batch, BatchKilledException, STDOUT_PATH, STDERR_PATH
-
-
 from metaflow import util
 from metaflow import R
-from metaflow.datastore import MetaflowDataStore
-from metaflow.datastore.local import LocalDataStore
-from metaflow.datastore.util.s3util import get_s3_client
-from metaflow.exception import (
-    CommandException,
-    METAFLOW_EXIT_DISALLOW_RETRY,
-)
-from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
-from metaflow.mflog import TASK_LOG_SOURCE
-from ..aws_utils import get_docker_registry, sync_metadata_from_S3
+from metaflow.exception import CommandException, METAFLOW_EXIT_DISALLOW_RETRY
+
+from .kubernetes import Kubernetes, KubernetesKilledException
+from ..aws_utils import sync_metadata_from_S3
 
 @click.group()
 def cli():
     pass
 
 @cli.group(help='Commands related to Kubernetes on Amazon EKS.')
-def k8s():
+def kubernetes():
     pass
 
-@k8s.command(
+@kubernetes.command(
     help='Execute a single task on Kubernetes using Amazon EKS. This command '
     'calls the top-level step command inside a Kubernetes job with the given '
     'options. Typically you do not call this command directly; it is used '
@@ -45,8 +32,9 @@ def k8s():
                 help='Executable requirement for Kubernetes job.')
 @click.option('--image',
                 help='Docker image requirement for Kubernetes job.')
-@click.option('--iam-role',
-                help='IAM role requirement for Kubernetes job on Amazon EKS.')
+@click.option('--service-account',
+                # TODO: Support more auth mechanisms besides IRSA
+                help='IRSA requirement for Kubernetes job on Amazon EKS.')
 @click.option('--cpu',
                 help='CPU requirement for Kubernetes job.')
 @click.option('--gpu',
@@ -54,52 +42,51 @@ def k8s():
 @click.option('--memory',
                 help='Memory requirement for Kubernetes job.')
 @click.option('--run-id',
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--task-id',
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--input-paths',
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--split-index',
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--clone-path',
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--clone-run-id',
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--tag',
                 multiple=True,
                 default=None,
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--namespace',
                 default=None,
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--retry-count',
                 default=0,
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--max-user-code-retries',
                 default=0,
-                help='Passed to the top-level 'step'.')
+                help='Passed to the top-level \'step\'.')
 @click.option('--run-time-limit',
                 default=5 * 24 * 60 * 60, # Default is set to 5 days
                 help='Run time limit in seconds for Kubernetes job.')
 @click.pass_context
-def step(
-    ctx,
-    step_name,
-    code_package_sha,
-    code_package_url,
-    executable=None,
-    image=None,
-    iam_role=None,
-    cpu=None,
-    gpu=None,
-    memory=None,
-    run_time_limit=None,
-    **kwargs
-):
-    def echo(msg, stream='stderr', batch_id=None):
+def step(ctx,
+         step_name,
+         code_package_sha,
+         code_package_url,
+         executable=None,
+         image=None,
+         service_account=None,
+         cpu=None,
+         gpu=None,
+         memory=None,
+         run_time_limit=None,
+         **kwargs):
+
+    def echo(msg, stream='stderr', job_id=None):
         msg = util.to_unicode(msg)
-        if batch_id:
-            msg = '[%s] %s' % (batch_id, msg)
+        if job_id:
+            msg = '[%s] %s' % (job_id, msg)
         ctx.obj.echo_always(msg, err=(stream == sys.stderr))
 
     node = ctx.obj.graph[step_name]
@@ -107,7 +94,7 @@ def step(
         ctx.obj.datastore.datastore_root = \
             ctx.obj.datastore.get_datastore_root_from_config(echo)
 
-    # Set executable for job entrypoint CLI.
+    # Set executable for job entrypoint.
     if R.use_r():
         entrypoint = R.entrypoint()
     else:
@@ -116,7 +103,7 @@ def step(
         entrypoint = '%s -u %s' % (executable,
                                    os.path.basename(sys.argv[0]))
 
-    # Construct job entrypoint CLI. 
+    # Construct job entrypoint. 
     input_paths = kwargs.get('input_paths')
     split_vars = None
     if input_paths:
@@ -180,36 +167,40 @@ def step(
     # this information is needed for log tailing
     spec = task_spec.copy()
     spec['attempt'] = int(spec.pop('retry_count'))
-    ds = ctx.obj.datastore(mode='w', **spec)
-    stdout_location = ds.get_log_location(TASK_LOG_SOURCE, 'stdout')
-    stderr_location = ds.get_log_location(TASK_LOG_SOURCE, 'stderr')
+    # ds = ctx.obj.datastore(mode='w', **spec)
+    # stdout_location = ds.get_log_location(TASK_LOG_SOURCE, 'stdout')
+    # stderr_location = ds.get_log_location(TASK_LOG_SOURCE, 'stderr')
+    print(step_cli)
+    kubernetes = Kubernetes(ctx.obj.datastore,
+                            ctx.obj.metadata,
+                            ctx.obj.environment)
 
-    batch = Batch(ctx.obj.metadata, ctx.obj.environment)
     try:
-        with ctx.obj.monitor.measure('metaflow.batch.launch'):
-            batch.launch_job(
-                step_name,
-                step_cli,
-                task_spec,
-                code_package_sha,
-                code_package_url,
-                ctx.obj.datastore.TYPE,
-                image=image,
-                iam_role=iam_role,
-                cpu=cpu,
-                gpu=gpu,
-                memory=memory,
-                run_time_limit=run_time_limit,
-                env=env,
-                attrs=attrs
-            )
+        with ctx.obj.monitor.measure('metaflow.aws.eks.launch_job'):
+            job = kubernetes.create_job(user=util.get_username(),
+                                        flow_name=ctx.obj.flow.name,
+                                        run_id=kwargs['run_id'],
+                                        step_name=step_name,
+                                        task_id=kwargs['task_id'],
+                                        attempt=str(retry_count),
+                                        code_package_sha=code_package_sha,
+                                        code_package_url=code_package_url,
+                                        code_package_ds=ctx.obj.datastore.TYPE,
+                                        step_cli=step_cli,
+                                        docker_image=image,
+                                        service_account=service_account,
+                                        cpu=cpu,
+                                        gpu=gpu,
+                                        memory=memory,
+                                        run_time_limit=run_time_limit,
+                                        env=env).execute()
     except Exception as e:
         print(e)
         sync_metadata_from_S3(ctx.obj.metadata, datastore_root, retry_count)
         sys.exit(METAFLOW_EXIT_DISALLOW_RETRY)
     try:
-        batch.wait(stdout_location, stderr_location, echo=echo)
-    except BatchKilledException:
+        kubernetes.wait(job=job, echo=echo)
+    except KubernetesKilledException:
         # don't retry killed tasks
         traceback.print_exc()
         sync_metadata_from_S3(ctx.obj.metadata, datastore_root, retry_count)

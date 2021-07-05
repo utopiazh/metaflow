@@ -32,9 +32,9 @@ except ImportError as e:
         MONITOR_SIDECARS={})
 else:
     # We load into globals whatever we have in extension_module
-    # We specifically exclude any modules that may be included (like sys, os, etc)
-    # *except* for ones that are part of metaflow_custom (basically providing
-    # an aliasing mechanism)
+    # We specifically exclude any modules that may be included (like sys, os 
+    # etc.) *except* for ones that are part of metaflow_custom (basically 
+    # providing an aliasing mechanism)
     lazy_load_custom_modules = {}
     addl_modules = _ext_plugins.__dict__.get('__mf_promote_submodules__')
     if addl_modules:
@@ -50,11 +50,11 @@ else:
                 o.__package__.startswith('metaflow_custom'):
             lazy_load_custom_modules['metaflow.plugins.%s' % n] = o
     if lazy_load_custom_modules:
-        # NOTE: We load things first to have metaflow_custom override things here.
-        # This does mean that for modules that have the same name (for example,
-        # if metaflow_custom.plugins also provides a conda module), it needs
-        # to provide whatever is expected below (so for example a `conda_step_decorator`
-        # file with a `CondaStepDecorator` class).
+        # NOTE: We load things first to have metaflow_custom override things 
+        # here. This does mean that for modules that have the same name (for
+        # example, if metaflow_custom.plugins also provides a conda module), it 
+        # needs to provide whatever is expected below (so for example a 
+        # `conda_step_decorator` file with a `CondaStepDecorator` class).
         # We do this because we want metaflow_custom to fully override things
         # and if we did not change sys.meta_path here, the lines below would
         # load the non metaflow_custom modules providing for possible confusion.
@@ -64,65 +64,74 @@ else:
 
 
 def get_plugin_cli():
-    # it is important that CLIs are not imported when
+    # It is important that CLIs are not imported when
     # __init__ is imported. CLIs may use e.g.
     # parameters.add_custom_parameters which requires
     # that the flow is imported first
 
     # Add new CLI commands in this list
     from . import package_cli
+
     from .aws.batch import batch_cli
     from .aws.step_functions import step_functions_cli
+    from .aws.eks import eks_cli
 
     return _ext_plugins.get_plugin_cli() + [
         package_cli.cli,
         batch_cli.cli,
-        step_functions_cli.cli]
+        step_functions_cli.cli,
+        eks_cli.cli]
 
 
 def _merge_lists(base, overrides, attr):
     # Merge two lists of classes by comparing them for equality using 'attr'.
     # This function prefers anything in 'overrides'. In other words, if a class
-    # is present in overrides and matches (according to the equality criterion) a class in
-    # base, it will be used instead of the one in base.
+    # is present in overrides and matches (according to the equality criterion) 
+    # a class in base, it will be used instead of the one in base.
     l = list(overrides)
     existing = set([getattr(o, attr) for o in overrides])
     l.extend([d for d in base if getattr(d, attr) not in existing])
     return l
 
-# Add new decorators in this list
+# Every entry in this list becomes a function-level step decorator.
+# Add an entry here if you need a new step-level annotation. Be
+# careful with the choice of name though - they become top-level
+# imports from the metaflow package.
 from .catch_decorator import CatchDecorator
 from .timeout_decorator import TimeoutDecorator
 from .environment_decorator import EnvironmentDecorator
 from .resources_decorator import ResourcesDecorator
 from .retry_decorator import RetryDecorator
+from .conda.conda_step_decorator import CondaStepDecorator
+from .test_unbounded_foreach_decorator\
+                import InternalTestUnboundedForeachDecorator, \
+                        InternalTestUnboundedForeachInput
 from .aws.batch.batch_decorator import BatchDecorator
+from .aws.eks.kubernetes_decorator import KubernetesDecorator
 from .aws.step_functions.step_functions_decorator \
                 import StepFunctionsInternalDecorator
-from .test_unbounded_foreach_decorator\
-    import InternalTestUnboundedForeachDecorator, InternalTestUnboundedForeachInput
-from .conda.conda_step_decorator import CondaStepDecorator
-
 STEP_DECORATORS = _merge_lists([CatchDecorator,
                                 TimeoutDecorator,
                                 EnvironmentDecorator,
                                 ResourcesDecorator,
                                 RetryDecorator,
-                                BatchDecorator,
-                                StepFunctionsInternalDecorator,
                                 CondaStepDecorator,
-                                InternalTestUnboundedForeachDecorator],
+                                InternalTestUnboundedForeachDecorator,
+                                BatchDecorator,
+                                KubernetesDecorator,
+                                StepFunctionsInternalDecorator],
                                     _ext_plugins.STEP_DECORATORS, 'name')
 
 # Add Conda environment
 from .conda.conda_environment import CondaEnvironment
-ENVIRONMENTS = _merge_lists([CondaEnvironment], _ext_plugins.ENVIRONMENTS, 'TYPE')
+ENVIRONMENTS = _merge_lists([CondaEnvironment],
+                                _ext_plugins.ENVIRONMENTS, 'TYPE')
 
 # Metadata providers
 from .metadata import LocalMetadataProvider, ServiceMetadataProvider
-
-METADATA_PROVIDERS = _merge_lists(
-    [LocalMetadataProvider, ServiceMetadataProvider], _ext_plugins.METADATA_PROVIDERS, 'TYPE')
+METADATA_PROVIDERS = _merge_lists([LocalMetadataProvider,
+                                   ServiceMetadataProvider],
+                                       _ext_plugins.METADATA_PROVIDERS, 'TYPE')
 
 # Every entry in this list becomes a class-level flow decorator.
 # Add an entry here if you need a new flow-level annotation. Be
@@ -134,13 +143,12 @@ from .project_decorator import ProjectDecorator
 FLOW_DECORATORS = _merge_lists([CondaFlowDecorator,
                                 ScheduleDecorator,
                                 ProjectDecorator],
-                            _ext_plugins.FLOW_DECORATORS, 'name')
+                                    _ext_plugins.FLOW_DECORATORS, 'name')
 
 
 # Sidecars
 from ..mflog.save_logs_periodically import SaveLogsPeriodicallySidecar
 from metaflow.metadata.heartbeat import MetadataHeartBeat
-
 SIDECARS = {'save_logs_periodically': SaveLogsPeriodicallySidecar,
             'heartbeat': MetadataHeartBeat}
 SIDECARS.update(_ext_plugins.SIDECARS)
@@ -150,14 +158,13 @@ from .debug_logger import DebugEventLogger
 LOGGING_SIDECARS = {'debugLogger': DebugEventLogger,
                     'nullSidecarLogger': None}
 LOGGING_SIDECARS.update(_ext_plugins.LOGGING_SIDECARS)
+SIDECARS.update(LOGGING_SIDECARS)
 
 # Add monitor
 from .debug_monitor import DebugMonitor
 MONITOR_SIDECARS = {'debugMonitor': DebugMonitor,
                     'nullSidecarMonitor': None}
 MONITOR_SIDECARS.update(_ext_plugins.MONITOR_SIDECARS)
-
-SIDECARS.update(LOGGING_SIDECARS)
 SIDECARS.update(MONITOR_SIDECARS)
 
 # Erase all temporary names to avoid leaking things

@@ -1,32 +1,19 @@
-# -*- coding: utf-8 -*-
-from collections import defaultdict, deque
-import random
-import select
-import sys
-import time
-import hashlib
-
-try:
-    unicode
-except NameError:
-    unicode = str
-    basestring = str
+from collections import defaultdict
 
 from metaflow.exception import MetaflowException
-from metaflow.metaflow_config import AWS_SANDBOX_ENABLED
 
+# TODO: Verify sandbox capabilities
 class KubernetesClient(object):
 
     def __init__(self):
+        # TODO: Provide different ways of configuring the kubernetes client.
+        # TODO: Get rid of the kubernetes python client.
         from kubernetes import client, config
         config.load_kube_config()
         self._client = client.BatchV1Api()
 
-
-
-
     def job(self):
-        return KubernetesBatchJob(self._client)
+        return KubernetesJob(self._client)
 
     def attach_job(self, job_id):
         job = RunningJob(job_id, self._client)
@@ -38,87 +25,155 @@ class BatchJobException(MetaflowException):
     headline = 'AWS Batch job error'
 
 
-class KubernetesBatchJob(object):
+class KubernetesJob(object):
 
     def __init__(self, client):
         self._client = client
         tree = lambda: defaultdict(tree)
+        # self.payload maps to Job v1 batch spec
+        # https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.21/#jobspec-v1-batch
         self.payload = tree()
 
-    def job_name(self, job_name):
-        self.payload['name'] = job_name
-        return self
+        # Instantiate job config
+        self.payload['apiVersion'] = 'batch/v1'
+        self.payload['kind'] = 'Job'
 
-    def image(self, image):
-        self.payload['image'] = image
+    # TODO: Support docker image secrets
+    # TODO: Support node selection (for GPUs etc.)
+    # TODO: Ascertain default terminationGracePeriodSeconds
+    # TODO: Support volumes
+    # TODO: Support tolerations and affinities
+    # TODO: Support namespaces
+
+    def execute(self):
+        response = self._client.create_namespaced_job(body=self.payload,
+                                                      namespace='default',
+                                                      pretty='True')
+        # TODO: Error handling here?
+        print(response.status)
+        print(response.to_dict())
+        job = RunningJob(
+                response.to_dict()['spec']['template']['metadata']['name'],
+                self._client)
+        return job.update()
+
+
+    def name(self, name):
+        self.metadata('name', name)
+        template = self.payload['spec']['template']
+        if 'containers' not in template['spec']:
+            template['spec']['containers'] = [{}]
+        template['spec']['containers'][0]['name'] = name
         return self
 
     def command(self, command):
-        self.payload['command'] = command
+        template = self.payload['spec']['template']
+        if 'containers' not in template['spec']:
+            template['spec']['containers'] = [{}]
+        template['spec']['containers'][0]['command'] = command
+        return self
+
+    def image(self, image):
+        template = self.payload['spec']['template']
+        if 'containers' not in template['spec']:
+            template['spec']['containers'] = [{}]
+        template['spec']['containers'][0]['image'] = image
+        return self
+
+    def cpu(self, cpu):
+        template = self.payload['spec']['template']
+        if 'containers' not in template['spec']:
+            template['spec']['containers'] = [{}]
+        # TODO: Fix this!
+        # template['spec']['containers'][0]['resources']['limits']['cpu'] = cpu
+        # template['spec']['containers'][0]['resources']['requests']['cpu'] = cpu
+        return self
+
+    def memory(self, memory):
+        template = self.payload['spec']['template']
+        if 'containers' not in template['spec']:
+            template['spec']['containers'] = [{}]
+        # TODO: Fix this!
+        # template['spec']['containers'][0]['resources']['limits']['memory'] = \
+        #                                                                 memory
+        # template['spec']['containers'][0]['resources']['requests']['memory'] = \
+        #                                                                 memory
+        return self
+
+    def gpu(self, gpu):
         return self
 
     def environment_variable(self, name, value):
-        if not self.payload['env'] :
-            self.payload['env']= []
-        self.payload['env'].append({'name': name, 'value': str(value)})
+        template = self.payload['spec']['template']
+        if 'containers' not in template['spec']:
+            template['spec']['containers'] = [{}]
+        if 'env' not in template['spec']['containers'][0]:
+            template['spec']['containers'][0]['env'] = []
+        template['spec']['containers'][0]['env'].append({'value' : str(value),
+                                                         'name': name})
+        return self  
+
+    def namespace(self, namespace):
+        # TODO: Handle it centrally?
+        self.metadata('namespace', namespace)
         return self
 
-    def to_spec(self):
-        spec = {
-            'apiVersion': 'batch/v1', # Assuming batch/v1 for now.
-            'kind': 'Job',
-            'metadata': {
-                'name': self.payload['name'],
-                'labels': 'hello'
-            },
-            'spec': {
-                'template': {
-                    'metadata': {
-                        'labels': {
-                            'app': 'pi',
-                        },
-                    },
-                    'spec': {
-                        'containers': [self.payload],
-                        'restartPolicy': 'Never'
-                    }
-                },
-                'backoffLimit': 1,      # retries handled by Metaflow
-                'ttlSecondsAfterFinished': 600
-            }
-        }
-        return spec
+    def retries(self, retries):
+        # If unset, default is 6 retries
+        # https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.21/#jobspec-v1-batch
+        self.payload['spec']['backoffLimit'] = retries
+        return self
 
-class Throttle(object):
-    def __init__(self, delta_in_secs=1, num_tries=20):
-        self.delta_in_secs = delta_in_secs
-        self.num_tries = num_tries
-        self._now = None
-        self._reset()
+    def timeout_in_secs(self, timeout_in_secs):
+        # Set timeout at the pod level rather than at the job level. This
+        # ensures that the timer is restarted when the pod restarts - mirroring
+        # @timeout decorator's semantics.
+        self.payload['spec']['template']['spec']['activeDeadlineSeconds'] = \
+                                                                timeout_in_secs
+        return self
 
-    def _reset(self):
-        self._tries_left = self.num_tries
-        self._wait = self.delta_in_secs
+    def scheduler(self, scheduler):
+        # TODO: Test with something other than kube-scheduler
+        self.payload['spec']['template']['spec']['schedulerName'] = scheduler
+        return self
 
-    def __call__(self, func):
-        def wrapped(*args, **kwargs):
-            now = time.time()
-            if self._now is None or (now - self._now > self._wait):
-                self._now = now
-                try:
-                    func(*args, **kwargs)
-                    self._reset()
-                except TriableException as ex:
-                    self._tries_left -= 1
-                    if self._tries_left == 0:
-                        raise ex.ex
-                    self._wait = (self.delta_in_secs*1.2)**(self.num_tries-self._tries_left) + \
-                        random.randint(0, 3*self.delta_in_secs)
-        return wrapped
+    def service_account(self, service_account):
+        # TODO: serviceAccount is the deprecated alias for serviceAccountName.
+        # Verify older versions of Kubernetes work as expected.
+        self.payload['spec']['template']['spec']['serviceAccountName'] = \
+                                                                service_account
+        return self
 
-class TriableException(Exception):
-    def __init__(self, ex):
-        self.ex = ex
+    def annotation(self, key, value):
+        # TODO: Do we need to set the annotations at both, job and pod level?
+        self.payload['metadata']['annotations'][key] = str(value)
+        self.payload['spec']['template']['metadata']['annotations'][key] = \
+                                                                    str(value)
+        return self
+
+    def label(self, key, value):
+        # TODO: Do we need to set the labels at both, job and pod level?
+        self.payload['metadata']['labels'][key] = str(value)
+        self.payload['spec']['template']['metadata']['labels'][key] = str(value)
+        return self
+
+    def metadata(self, key, value):
+        # TODO: Do we need to set the metadata at both, job and pod level?
+        self.payload['metadata'][key] = value
+        self.payload['spec']['template']['metadata'][key] = value
+        return self
+
+    def cleanup_ttl_in_secs(self, cleanup_ttl_in_secs):
+        self.payload['spec']['ttlSecondsAfterFinished'] = cleanup_ttl_in_secs
+        return self
+
+    def restart_policy(self, restart_policy):
+        self.payload['spec']['template']['spec']['restartPolicy'] = \
+                                                                restart_policy
+        return self
+
+
+
 
 class RunningJob(object):
 
@@ -135,7 +190,7 @@ class RunningJob(object):
     def _apply(self, data):
         self._data = data
 
-    @Throttle()
+
     def _update(self):
         try:
             data = self._client.describe_jobs(jobs=[self._id])
@@ -233,48 +288,7 @@ class RunningJob(object):
     def log_stream_name(self):
         return self.info['container'].get('logStreamName')
 
-    def logs(self):
-        def get_log_stream(job):
-            log_stream_name = job.log_stream_name
-            if log_stream_name:
-                return BatchLogs('/aws/batch/job', log_stream_name, sleep_on_no_data=1)
-            else:
-                return None
 
-        log_stream = None
-        while True:
-            if self.is_running or self.is_done or self.is_crashed:
-                log_stream = get_log_stream(self)
-                break
-            elif not self.is_done:
-                self.wait_for_running()
-
-        if log_stream is None:
-            return 
-        exception = None
-        for i in range(self.NUM_RETRIES + 1):
-            try:
-                check_after_done = 0
-                for line in log_stream:
-                    if not line:
-                        if self.is_done:
-                            if check_after_done > 1:
-                                return
-                            check_after_done += 1
-                        else:
-                            pass
-                    else:
-                        i = 0
-                        yield line
-                return
-            except Exception as ex:
-                exception = ex
-                if self.is_crashed:
-                    break
-                #sys.stderr.write(repr(ex) + '\n')
-                if i < self.NUM_RETRIES:
-                    time.sleep(2 ** i + random.randint(0, 5))
-        raise BatchJobException(repr(exception))
 
     def kill(self):
         if not self.is_done:

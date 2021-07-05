@@ -2,7 +2,6 @@ import os
 import sys
 import platform
 
-
 from metaflow import R
 from metaflow import util
 from metaflow.decorators import StepDecorator
@@ -10,12 +9,10 @@ from metaflow.datastore.datastore import TransformableObject
 from metaflow.plugins import ResourcesDecorator
 from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
 from metaflow.metadata import MetaDatum
-from metaflow.metaflow_config import ECS_S3_ACCESS_IAM_ROLE, BATCH_JOB_QUEUE, \
-                    BATCH_CONTAINER_IMAGE, BATCH_CONTAINER_REGISTRY, \
-                    ECS_FARGATE_EXECUTION_ROLE, DATASTORE_LOCAL_DIR
+from metaflow.metaflow_config import BATCH_CONTAINER_IMAGE, BATCH_CONTAINER_REGISTRY, \
+                    DATASTORE_LOCAL_DIR
 from metaflow.sidecar import SidecarSubProcess
 
-from .batch import Batch, BatchException
 from ..aws_utils import get_docker_registry, sync_metadata_to_S3
 
 
@@ -25,9 +22,11 @@ class KubernetesDecorator(StepDecorator):
     Batch job.
 
     Note that you can apply this decorator automatically to all steps using the
-    ```--with k8s``` argument when calling run/resume. Step level decorators 
-    specified in the code are overrides and will force a step to execute
-    as a Kubernetes Batch job regardless of the ```--with``` specification.
+    ```--with kubernetes``` argument when calling run/resume. Step level 
+    decorators specified in the code are overrides and will force a step to 
+    execute as a Kubernetes Batch job regardless of the ```--with``` 
+    specification.
+    
     To use, annotate your step as follows:
     
     ```
@@ -52,7 +51,7 @@ class KubernetesDecorator(StepDecorator):
         Image to use when launching the Kubernetes Batch job. If not specified,
         a default image mapping to the current version of Python is used.
     """
-    name = 'k8s'
+    name = 'kubernetes'
     defaults = {
         'cpu': '1',
         'gpu': '0',
@@ -69,15 +68,22 @@ class KubernetesDecorator(StepDecorator):
 
         # If no docker image is explicitly specified, impute a default image.
         if not self.attributes['image']:
+            # If metaflow-config specifies a docker image, just use that.
             if BATCH_CONTAINER_IMAGE:
                 self.attributes['image'] = BATCH_CONTAINER_IMAGE
+            # If metaflow-config doesn't specify a docker image, assign a 
+            # default docker image.
             else:
+                # Metaflow-R has it's own default docker image (rocker family)
                 if R.use_r():
                     self.attributes['image'] = R.container_image()
+                # Default to vanilla Python image corresponding to major.minor
+                # version of the Python interpreter launching the flow.
                 else:
                     self.attributes['image'] = \
                         'python:%s.%s' % (platform.python_version_tuple()[0],
                                             platform.python_version_tuple()[1])
+        # Assign docker registry URL for the image.
         if not get_docker_registry(self.attributes['image']):
             if BATCH_CONTAINER_REGISTRY:
                 self.attributes['image'] = \
@@ -98,11 +104,11 @@ class KubernetesDecorator(StepDecorator):
         # Executing Batch jobs on Kubernetes requires a non-local datastore.
         # At the moment, Metaflow's cloud-native datastore integration is with
         # Amazon S3, so we explictly check here if datastore is configured to
-        # Amazon S3. As we support more clouds and local kubernetes execution,
-        # we can do away with this check.
+        # Amazon S3. In the future, as we support more clouds and local 
+        # kubernetes execution, we can suitably modify this check.
         if datastore.TYPE != 's3':
             raise KubernetesException(
-                'The *@k8s* decorator requires --datastore=s3.')
+                'The *@kubernetes* decorator requires --datastore=s3.')
 
         # Set internal state.
         self.logger = logger
@@ -113,7 +119,7 @@ class KubernetesDecorator(StepDecorator):
             if isinstance(deco, ResourcesDecorator):
                 for k, v in deco.attributes.items():
                     # We use the larger of @resources and @k8s attributes
-                    # TODO: https://github.com/Netflix/metaflow/issues/467
+                    # TODO: Fix https://github.com/Netflix/metaflow/issues/467
                     my_val = self.attributes.get(k)
                     if not (my_val is None and v is None):
                         self.attributes[k] = \
@@ -155,9 +161,10 @@ class KubernetesDecorator(StepDecorator):
                          max_user_code_retries,
                          ubf_context):
         # After all attempts to run the user code have failed, we don't need
-        # Kubernetes anymore. We can execute possible fallback code locally.
+        # to execute on Kubernetes anymore; we can execute possible fallback
+        # code locally.
         if retry_count <= max_user_code_retries:
-            cli_args.commands = ['k8s', 'step']
+            cli_args.commands = ['kubernetes', 'step']
             cli_args.command_args.append(self.package_sha)
             cli_args.command_args.append(self.package_url)
             cli_args.command_options.update(self.attributes)
@@ -176,7 +183,7 @@ class KubernetesDecorator(StepDecorator):
                       retry_count,
                       max_retries,
                       ubf_context):
-        # If `local` metadata is configured, then we would need to copy task
+        # If `local` metadata is configured, we would need to copy task
         # execution metadata from the Kubernetes Batch container to user's
         # local file system after the user code has finished execution. This
         # happens via datastore as a communication bridge.

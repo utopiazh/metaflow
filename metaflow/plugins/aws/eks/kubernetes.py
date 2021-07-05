@@ -13,7 +13,6 @@ from metaflow.metaflow_config import BATCH_METADATA_SERVICE_URL, DATATOOLS_S3ROO
     BATCH_METADATA_SERVICE_HEADERS
 from metaflow import util
 
-from .batch_client import BatchClient
 
 from metaflow.datastore.util.s3tail import S3Tail
 from metaflow.mflog.mflog import refine, set_should_persist
@@ -21,6 +20,8 @@ from metaflow.mflog import export_mflog_env_vars,\
                            bash_capture_logs,\
                            update_delay,\
                            BASH_SAVE_LOGS
+
+from .kubernetes_client import KubernetesClient
 
 # Redirect structured logs to /logs/
 LOGS_DIR = '/logs'
@@ -33,113 +34,139 @@ class KuberneterException(MetaflowException):
     headline = 'Kubernetes error'
 
 
-class KubernetesBatchJobKilledException(MetaflowException):
+class KubernetesKilledException(MetaflowException):
     headline = 'Kubernetes Batch job killed'
 
 
 class Kubernetes(object):
 
     def __init__(self,
-                 environment):
+                 datastore,
+                 metadata,
+                 environment,):
+        self.datastore = datastore
+        self.metadata = metadata
         self.environment = environment
-        self.k8s_client = KubernetesClient()
 
-        # Issue a kill request for all pending Batch jobs at exit.
-        atexit.register(
-            lambda: self.job.kill() if hasattr(self, 'job') else None)
+        self.kubernetes_client = KubernetesClient()
+
+        # TODO: Issue a kill request for all pending Kubernetes Batch jobs at exit.
+        # atexit.register(
+        #     lambda: self.job.kill() if hasattr(self, 'job') else None)
+
 
     def _command(self,
-                 environment,
-                 code_package_url,
-                 step_name,
-                 step_cmds,
-                 task_spec):
-        mflog_expr = export_mflog_env_vars(datastore_type='s3',
-                                           stdout_path=STDOUT_PATH,
-                                           stderr_path=STDERR_PATH,
-                                           **task_spec)
-        init_cmds = environment.get_package_commands(code_package_url)
-        init_expr = ' && '.join(init_cmds)
-        step_expr = bash_capture_logs(' && '.join(
-                        environment.bootstrap_commands(step_name) + step_cmds))
-
-        # construct an entry point that
-        # 1) initializes the mflog environment (mflog_expr)
-        # 2) bootstraps a metaflow environment (init_expr)
-        # 3) executes a task (step_expr)
-
-        # the `true` command is to make sure that the generated command
-        # plays well with docker containers which have entrypoint set as
-        # eval $@
-        cmd_str = 'true && mkdir -p /logs && %s && %s && %s; ' % \
-                        (mflog_expr, init_expr, step_expr)
-        # after the task has finished, we save its exit code (fail/success)
-        # and persist the final logs. The whole entrypoint should exit
-        # with the exit code (c) of the task.
-        #
-        # Note that if step_expr OOMs, this tail expression is never executed.
-        # We lose the last logs in this scenario (although they are visible 
-        # still through AWS CloudWatch console).
-        cmd_str += 'c=$?; %s; exit $c' % BASH_SAVE_LOGS
-        return shlex.split('bash -c \"%s\"' % cmd_str)
-
-    def job_name(self,
-                 user,
                  flow_name,
                  run_id,
                  step_name,
                  task_id,
-                 retry_count):
-        return '{user}-{flow_name}-{run_id}-{step_name}-{task_id}'
-                    '-{retry_count}'.format(
-                        user=user,
-                        flow_name=flow_name,
-                        run_id=str(run_id) if run_id is not None else '',
-                        step_name=step_name,
-                        task_id=str(task_id) if task_id is not None else '',
-                        retry_count=str(retry_count) \
-                                        if retry_count is not None else '')
+                 attempt,
+                 code_package_url,
+                 step_cmds):
+        mflog_expr = export_mflog_env_vars(flow_name=flow_name,
+                                           run_id=run_id,
+                                           step_name=step_name,
+                                           task_id=task_id,
+                                           retry_count=attempt,
+                                           datastore_type=self.datastore.TYPE,
+                                           stdout_path=STDOUT_PATH,
+                                           stderr_path=STDERR_PATH)
+        return ['echo', 'hello']
+        init_cmds = self.environment.get_package_commands(code_package_url)
+        init_expr = ' && '.join(init_cmds)
+        step_expr = bash_capture_logs(' && '.join(
+                        self.environment.bootstrap_commands(step_name) 
+                            + step_cmds))
+
+        # Construct an entry point that
+        # 1) initializes the mflog environment (mflog_expr)
+        # 2) bootstraps a metaflow environment (init_expr)
+        # 3) executes a task (step_expr)
+
+        # The `true` command is to make sure that the generated command
+        # plays well with docker containers which have entrypoint set as
+        # eval $@
+        cmd_str = 'true && mkdir -p /logs && %s && %s && %s; ' % \
+                        (mflog_expr, init_expr, step_expr)
+        # After the task has finished, we save its exit code (fail/success)
+        # and persist the final logs. The whole entrypoint should exit
+        # with the exit code (c) of the task.
+        #
+        # Note that if step_expr OOMs, this tail expression is never executed.
+        # We lose the last logs in this scenario.
+        #
+        # TODO: Find a way to capture hard exit logs.
+        cmd_str += 'c=$?; %s; exit $c' % BASH_SAVE_LOGS
+        return shlex.split('bash -c \"%s\"' % cmd_str)
+
+    def _name(self,
+              user,
+              flow_name,
+              run_id,
+              step_name,
+              task_id,
+              attempt):
+        return '{user}-{flow_name}-{run_id}-' \
+                    '{step_name}-{task_id}-{attempt}'.format(
+                            user=user,
+                            flow_name=flow_name,
+                            run_id=str(run_id) \
+                                    if run_id is not None else '',
+                            step_name=step_name,
+                            task_id=str(task_id) \
+                                    if task_id is not None else '',
+                            attempt=str(attempt) \
+                                    if attempt is not None else '').lower()
 
     def create_job(self,
+                   user,
+                   flow_name,
+                   run_id,
                    step_name,
-                   step_cli,
-                   task_spec,
+                   task_id,
+                   attempt,
                    code_package_sha,
                    code_package_url,
                    code_package_ds,
-                   image,
-                   iam_role=None,
+                   step_cli,
+                   docker_image,
+                   service_account=None,
                    cpu=None,
                    gpu=None,
                    memory=None,
                    run_time_limit=None,
-                   env={},
-                   attrs={}):
-        job_name = self._job_name(
-            attrs.get('metaflow.user'),
-            attrs.get('metaflow.flow_name'),
-            attrs.get('metaflow.run_id'),
-            attrs.get('metaflow.step_name'),
-            attrs.get('metaflow.task_id'),
-            attrs.get('metaflow.retry_count')
-        )
-        job = self.k8s_client.job()
+                   env={}):
+        job = self.kubernetes_client.job()
         job \
-            .job_name(job_name) \
+            .name(
+                self._name(user=user,
+                           flow_name=flow_name,
+                           run_id=run_id,
+                           step_name=step_name,
+                           task_id=task_id,
+                           attempt=attempt)) \
             .command(
-                self._command(self.environment, code_package_url,
-                              step_name, [step_cli], task_spec)) \
-            .image(image) \
-            .iam_role(iam_role) \
+                self._command(flow_name=flow_name,
+                              run_id=run_id,
+                              step_name=step_name,
+                              task_id=task_id,
+                              attempt=attempt,
+                              code_package_url=code_package_url,
+                              step_cmds=[step_cli])) \
+            .image(docker_image) \
+            .service_account('s3-full-access') \
             .cpu(cpu) \
             .gpu(gpu) \
             .memory(memory) \
-            .timeout_in_secs(run_time_limit) \
+            .timeout_in_secs(run_time_limit)
+
+        # Set environment variables
+        job \
             .environment_variable('AWS_DEFAULT_REGION', 'us-west-2') \
             .environment_variable('METAFLOW_CODE_SHA', code_package_sha) \
             .environment_variable('METAFLOW_CODE_URL', code_package_url) \
             .environment_variable('METAFLOW_CODE_DS', code_package_ds) \
-            .environment_variable('METAFLOW_USER', attrs['metaflow.user']) \
+            .environment_variable('METAFLOW_USER', user) \
             .environment_variable('METAFLOW_SERVICE_URL', 
                                         BATCH_METADATA_SERVICE_URL) \
             .environment_variable('METAFLOW_SERVICE_HEADERS', 
@@ -159,46 +186,32 @@ class Kubernetes(object):
             # get_datastore_root_from_config in datastore/local.py).
         for name, value in env.items():
             job.environment_variable(name, value)
+        
+        # A Container in a Pod may fail for a number of reasons, such as 
+        # because the process in it exited with a non-zero exit code, or the 
+        # Container was killed due to OOM etc. If this happens, fail the pod
+        # and let Metaflow handle the retries.
+        job.restart_policy('Never').retries(0)
+
+        # Set annotations at the job and pod level
+        job \
+            .annotation('metaflow-flow-name', flow_name) \
+            .annotation('metaflow-run-id', run_id) \
+            .annotation('metaflow-step-name', step_name) \
+            .annotation('metaflow-task-id', task_id) \
+            .annotation('metaflow-attempt', attempt) \
+            .annotation('metaflow-user', user)
+
         return job
 
-    def launch_job(self,
-                   step_name,
-                   step_cli,
-                   task_spec,
-                   code_package_sha,
-                   code_package_url,
-                   code_package_ds,
-                   image
-                   iam_role=None,
-                   cpu=None,
-                   gpu=None,
-                   memory=None,
-                   run_time_limit=None,
-                   env={},
-                   attrs={}):
 
-        self.job = self.create_job(step_name,
-                                   step_cli,
-                                   task_spec,
-                                   code_package_sha,
-                                   code_package_url,
-                                   code_package_ds,
-                                   image,
-                                   iam_role,
-                                   cpu,
-                                   gpu,
-                                   memory,
-                                   run_time_limit,
-                                   env,
-                                   attrs).execute()
-
-    def wait(self, stdout_location, stderr_location, echo=None):
-        
+    def wait(self, job, stdout_location, stderr_location, echo=None):
+        self.job = job
         def wait_for_launch(job):
             status = job.status
             echo('Task is starting (status %s)...' % status,
                  'stderr',
-                 batch_id=job.id)
+                 job_id=job.id)
             t = time.time()
             while True:
                 if status != job.status or (time.time()-t) > 30:
@@ -206,7 +219,7 @@ class Kubernetes(object):
                     echo(
                         'Task is starting (status %s)...' % status,
                         'stderr',
-                        batch_id=job.id
+                        job_id=job.id
                     )
                     t = time.time()
                 if job.is_running or job.is_done or job.is_crashed:
